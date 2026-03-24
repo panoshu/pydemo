@@ -1,0 +1,54 @@
+llm:
+  base_url: "http://29.20.6.20/chatgpt/openai/v1"
+  timeout: 120
+
+  temperature: 0.1
+  context_window: 204800
+
+  llm_model: "glm5"
+  vlm_model: "qwen2p5_vl_72b_instruct"
+
+  embed_model: "qwen3_embedding_4b"
+  rerank_model: "qwen3_reranker_4b"
+
+  provider_private:
+    biz_no: "xxxx"
+    embed_api_url: "http://29.20.6.20/chatgpt/embedding/generate"
+    rerank_api_url: "http://29.20.6.20/chatgpt/rerank/generate"
+
+
+
+rag:
+  # 切片策略: "sentence"(按句语义切分,推荐), "fixed_length"(按长度强制切分), "markdown"(按层级切分)
+  chunk_strategy: "sentence"
+  chunk_size: 512
+  chunk_overlap: 50
+
+  similarity_top_k: 3
+  recall_multiplier: 2
+
+
+
+milvus:
+  uri: "./database/milvus_lite.db"
+  collection_name: "bid_compliance_rules_dev"
+  dim: 2560
+
+
+db:
+  host: "127.0.0.1"
+  port: 3306
+  user: "dev_user"
+
+api:
+  url: "http://127.0.0.1:8000"
+  timeout: 60
+
+log:
+  level: "DEBUG"
+  file: "logs/app-dev.log"
+
+feature:
+  enable_new_ui: true
+  max_export_limit: 500
+  promotion_banner_text: "【开发环境】当前为 Dev 环境，使用的是测试版知识库"
