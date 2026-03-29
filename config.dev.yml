@@ -1,9 +1,11 @@
 llm:
+  mode: "private"
   base_url: "http://29.20.6.20/chatgpt/openai/v1"
-  timeout: 120
+  timeout: 180
 
   temperature: 0.1
   context_window: 204800
+  max_retries: 0
 
   llm_model: "glm5"
   vlm_model: "qwen2p5_vl_72b_instruct"
@@ -11,8 +13,7 @@ llm:
   embed_model: "qwen3_embedding_4b"
   rerank_model: "qwen3_reranker_4b"
 
-  provider_private:
-    biz_no: "xxxx"
+  private_api:
     embed_api_url: "http://29.20.6.20/chatgpt/embedding/generate"
     rerank_api_url: "http://29.20.6.20/chatgpt/rerank/generate"
 
@@ -47,8 +48,10 @@ api:
 log:
   level: "DEBUG"
   file: "logs/app-dev.log"
+  request_detail: true
 
 feature:
   enable_new_ui: true
   max_export_limit: 500
   promotion_banner_text: "【开发环境】当前为 Dev 环境，使用的是测试版知识库"
+

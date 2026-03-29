@@ -4,7 +4,7 @@ import os
 
 from langchain_core.messages import HumanMessage
 
-from demo.llm.factory import get_async_vlm
+from demo.config.factory import get_async_vlm
 from demo.state import ReviewState
 
 logger = logging.getLogger(__name__)

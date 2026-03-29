@@ -6,7 +6,7 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
-from .models import (
+from demo.config.models import (
     ApiConfig,
     DatabaseConfig,
     FeatureConfig,

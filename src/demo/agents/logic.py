@@ -3,7 +3,7 @@ from typing import cast
 
 from pydantic import BaseModel, Field
 
-from demo.llm.factory import get_async_llm
+from demo.config.factory import get_async_llm
 from demo.state import ReviewIssue, ReviewState
 
 logger = logging.getLogger(__name__)

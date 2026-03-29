@@ -1,40 +1,38 @@
 import logging
 import logging.config
-from pathlib import Path
 
-from demo.config import get_settings
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from demo.config import PROJECT_ROOT, get_settings
 
 
 def setup_logging():
     """
-    企业级全局日志配置初始化
+    企业级全局日志配置初始化 (完美压制 Uvicorn 覆盖问题)
     """
     config = get_settings()
     log_file_path = PROJECT_ROOT / config.log.file
     log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 确保日志级别字符串是大写 (如 "DEBUG", "INFO")
+    log_level = str(config.log.level).upper()
+
     logging_config = {
         "version": 1,
-        # ⚠️ 关键：千万不要禁用已存在的 Logger，否则 Uvicorn/LlamaIndex 日志会丢失
         "disable_existing_loggers": False,
         "formatters": {
-            # 标准的控制台与文件输出格式
             "standard": {
                 "format": config.log.format,
                 "datefmt": "%Y-%m-%d %H:%M:%S",
             },
         },
         "handlers": {
-            # 控制台输出
             "console": {
+                "level": log_level,  # Handler 也要加上 Level
                 "formatter": "standard",
                 "class": "logging.StreamHandler",
                 "stream": "ext://sys.stdout",
             },
-            # 文件输出：使用大小轮转（最大 10MB，保留 5 个备份）
             "file": {
+                "level": log_level,  # Handler 也要加上 Level
                 "class": "logging.handlers.RotatingFileHandler",
                 "formatter": "standard",
                 "filename": str(log_file_path),
@@ -44,34 +42,48 @@ def setup_logging():
             },
         },
         "loggers": {
-            # 1. 捕获业务代码的 logger (模块名都是以 demo. 开头)
+            # 1. 业务日志：精确捕获以 demo 开头的所有模块
             "demo": {
                 "handlers": ["console", "file"],
-                "level": config.log.level,
-                "propagate": False,  # 防止向上传递给 root 重复打印
+                "level": log_level,
+                "propagate": False,
             },
-            # 2. 捕获 FastAPI/Uvicorn 的框架和请求日志，统统吸入咱们的日志文件中
+            # 2. 强制接管 Uvicorn 日志，使其和业务日志格式/输出统一
             "uvicorn": {
                 "handlers": ["console", "file"],
-                "level": "INFO",
+                "level": "INFO",  # 框架启动日志 INFO 即可，避免太吵
                 "propagate": False,
+            },
+            "uvicorn.error": {
+                "level": "INFO",
+                "propagate": True,  # 向上抛给 uvicorn 处理
             },
             "uvicorn.access": {
                 "handlers": ["console", "file"],
-                "level": "INFO",
+                "level": "INFO",  # HTTP 请求日志
                 "propagate": False,
             },
         },
         "root": {
-            # 3. 其他所有第三方包（如 httpx, sqlalchemy 等）走 Root，默认设为 WARNING 防止刷屏
+            # 3. Root 兜底：必须是 WARNING 或 INFO，千万别写 DEBUG！
+            # 否则 httpx, milvus 等第三方包的底层通讯报文会刷爆你的控制台
             "handlers": ["console", "file"],
             "level": "WARNING",
         },
     }
 
-    # 应用配置
+    # 1. 应用字典配置
     logging.config.dictConfig(logging_config)
 
-    # 初始化完成后测试打印一条
-    logger = logging.getLogger("demo.logger")
-    logger.debug(f"日志系统初始化完成，输出至: {log_file_path}")
+    # 2. 🌟 核心杀招：强行拔掉 Uvicorn 默认自带的 Handlers！
+    # 因为 Uvicorn 启动时可能会再次强插它自己的 Handler，导致出现双重打印
+    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        uvicorn_logger = logging.getLogger(logger_name)
+        # 清除多余的 handler，强制走我们 dictConfig 里配置的逻辑
+        uvicorn_logger.handlers.clear()
+
+    # 3. 初始化完成提示 (强行指定一个 demo 命名空间的 logger 来打印)
+    startup_logger = logging.getLogger("demo.system")
+    startup_logger.info(
+        f"✅ 全局日志系统挂载成功 | 级别: {log_level} | 路径: {log_file_path}"
+    )

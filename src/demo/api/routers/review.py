@@ -1,72 +1,163 @@
-import asyncio
-import base64
+# src/demo/api/routers/review.py
+import json
 import logging
-import os
-import tempfile
+import uuid
+from typing import AsyncGenerator
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+from langchain_core.runnables import RunnableConfig
+from numpy import isin
 
-from demo.schemas.review import ReviewRequest, ReviewResponse
-from demo.workflow import build_async_workflow
+from demo.rag.temp_engine import temporary_bid_rag
+from demo.schemas.review import ReviewRequest
+from demo.workflow import ReviewState, build_review_graph
 
+router = APIRouter(prefix="/api/review", tags=["Review"])
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["AI Review"])
 
 
-def cleanup_temp_files(file_paths: list[str]):
-    for path in file_paths:
+@router.post("/stream")
+async def stream_review(request: ReviewRequest):
+    """
+    企业级多智能体审查流式网关
+    将底层 LangGraph 和 LlamaIndex 的作业进度通过 SSE 实时推送到前端
+    """
+    # 1. 生成全局唯一会话 ID，贯穿图网络与临时数据库
+    session_id = uuid.uuid4().hex[:8]
+    logger.info(f"🆕 收到审查请求，分配 Session: {session_id}")
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        # 初始握手
+        yield (
+            json.dumps({"status": "start", "message": "🚀 正在初始化审查流水线..."})
+            + "\n"
+        )
+
         try:
-            if os.path.exists(path):
-                os.remove(path)
-                logger.debug(f"🧹 [清理] 已删除临时文件: {path}")
+            # ==========================================
+            # 2. 挂载临时双路 RAG 引擎 (上下文管理器确保绝对销毁)
+            # ==========================================
+            yield (
+                json.dumps(
+                    {
+                        "status": "processing",
+                        "agent": "系统编排",
+                        "message": "📦 正在对标书进行切片并构建临时向量空间...",
+                    }
+                )
+                + "\n"
+            )
+
+            async with temporary_bid_rag(request.document_text, session_id) as (
+                bid_engine,
+                chunks,
+            ):
+                yield (
+                    json.dumps(
+                        {
+                            "status": "processing",
+                            "agent": "系统编排",
+                            "message": f"✅ 临时知识库建库完成，共产生 {len(chunks)} 个切片。正在唤醒智能体...",
+                        }
+                    )
+                    + "\n"
+                )
+
+                # ==========================================
+                # 3. 组装 LangGraph 全局初始状态
+                # ==========================================
+                initial_state: ReviewState = {
+                    "document_text": request.document_text,
+                    "images_base64": request.images_base64,
+                    "checklist": request.checklist,
+                    "enable_full_text_check": request.enable_full_text_check,
+                    "enable_double_rag_check": request.enable_double_rag_check,
+                    "document_chunks": chunks,
+                    "session_id": session_id,
+                    "issues": [],
+                    "double_rag_logs": [],
+                    "error_traces": [],
+                    "extracted_data": {},
+                }
+
+                # ==========================================
+                # 4. 执行图网络并捕获流式事件 (stream_mode="updates")
+                # ==========================================
+                app = build_review_graph()
+                final_issues = []
+
+                total_chunks = len(chunks)
+                processed_chunks = 0
+
+                graph_config: RunnableConfig = {
+                    "max_concurrency": 1,
+                }
+
+                async for output in app.astream(
+                    initial_state,
+                    stream_mode="updates",
+                    config=graph_config,
+                ):
+                    for node_name, node_update in output.items():
+                        if isinstance(node_update, dict) and node_update.get("issues"):
+                            final_issues.extend(node_update["issues"])
+
+                        # 进度推送逻辑优化
+                        if node_name == "dispatch":
+                            yield (
+                                json.dumps(
+                                    {
+                                        "status": "processing",
+                                        "agent": "系统编排",
+                                        "message": "🚦 任务已分发，通读与比对智能体正在排队串行执行...",
+                                    }
+                                )
+                                + "\n"
+                            )
+
+                        elif node_name == "process_chunk_node":
+                            # 累加进度并推送到前端
+                            processed_chunks += 1
+                            yield (
+                                json.dumps(
+                                    {
+                                        "status": "processing",
+                                        "agent": "📝 全文通读",
+                                        "message": f"正在逐段精读标书... (进度: {processed_chunks}/{total_chunks})",
+                                    }
+                                )
+                                + "\n"
+                            )
+
+                        elif node_name == "compliance_node":
+                            yield (
+                                json.dumps(
+                                    {
+                                        "status": "processing",
+                                        "agent": "⚖️ 双向 RAG",
+                                        "message": "完成基于 CheckList 的公司规章双边核对！",
+                                    }
+                                )
+                                + "\n"
+                            )
+
+                # ==========================================
+                # 5. 图网络执行完毕，组装最终结果
+                # ==========================================
+                result_data = {
+                    "has_issues": len(final_issues) > 0,
+                    "issues": final_issues,
+                }
+                yield json.dumps({"status": "final", "data": result_data}) + "\n"
+
         except Exception as e:
-            logger.error(f"清理文件 {path} 失败: {e}")
+            logger.error(
+                f"审查流水线严重异常 [Session: {session_id}]: {e}", exc_info=True
+            )
+            yield (
+                json.dumps({"status": "error", "message": f"流水线中断: {str(e)}"})
+                + "\n"
+            )
 
-
-# 【重构点 1】改为 async def
-@router.post("/review", response_model=ReviewResponse)
-async def run_bid_review(request: ReviewRequest, background_tasks: BackgroundTasks):
-    temp_image_paths = []
-
-    # 【重构点 2】将耗时 IO (文件写操作) 放入线程池，防止阻塞 Async Event Loop
-    def write_images():
-        paths = []
-        for img_b64 in request.images_base64:
-            fd, path = tempfile.mkstemp(suffix=".jpg")
-            with os.fdopen(fd, "wb") as f:
-                f.write(base64.b64decode(img_b64))
-            paths.append(path)
-        return paths
-
-    if request.images_base64:
-        temp_image_paths = await asyncio.to_thread(write_images)
-
-    background_tasks.add_task(cleanup_temp_files, temp_image_paths)
-
-    initial_state = {
-        "document_text": request.document_text,
-        "image_paths": temp_image_paths,
-        "issues": [],
-        "extracted_data": {},
-    }
-
-    logger.info(
-        f"🚀 开始并行异步执行工作流 (文档长度: {len(request.document_text)}, 图片数: {len(temp_image_paths)})..."
-    )
-
-    graph_app = build_async_workflow()
-
-    # 【重构点 3】使用 ainvoke 异步执行 LangGraph，彻底释放工作线程
-    final_state = await graph_app.ainvoke(initial_state)
-
-    formatted_issues = [
-        f"【{issue['category']}】: {issue['message']}"
-        for issue in final_state.get("issues", [])
-    ]
-
-    return ReviewResponse(
-        status="success",
-        has_issues=len(formatted_issues) > 0,
-        issues=formatted_issues,
-        extracted_data=final_state.get("extracted_data", {}),
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

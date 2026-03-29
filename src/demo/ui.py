@@ -1,4 +1,5 @@
 import base64
+import json
 
 import requests
 import streamlit as st
@@ -155,7 +156,7 @@ if nav_selection == "💬 知识库问答":
 elif nav_selection == "📝 智能标书审查":
     st.header("📝 标书智能化审查引擎")
     st.markdown(
-        "上传标书文本与资质图片，由多 Agent 智能体并发执行**语法、逻辑、合规、视觉**四大维度的严格审查。"
+        "上传标书文本与资质图片，由多 Agent 智能体并发执行**全文精读**与**双向合规对比**。"
     )
     st.divider()
 
@@ -171,6 +172,11 @@ elif nav_selection == "📝 智能标书审查":
             accept_multiple_files=True,
         )
 
+        # 开放高级策略开关给用户
+        with st.expander("⚙️ 审查策略设置"):
+            enable_full_text = st.checkbox("开启逐段精读 (耗时较长)", value=True)
+            enable_double_rag = st.checkbox("开启双向 RAG 核对", value=True)
+
         submit_btn = st.button(
             "🚀 启动多智能体审查", type="primary", use_container_width=True
         )
@@ -178,51 +184,87 @@ elif nav_selection == "📝 智能标书审查":
     with col2:
         st.subheader("📊 审查报告")
         if submit_btn and doc_text.strip():
-            with st.status("🤖 Agent 正在并发作业中...", expanded=True) as status:
-                st.write("✅ 语法纠错智能体已启动")
-                st.write("✅ 关键信息抽取智能体已启动")
-                st.write("✅ 知识库合规校验已启动")
-                if uploaded_images:
-                    st.write("✅ 多模态视觉审计已启动")
+            with st.status("🤖 正在启动 AI 审查流水线...", expanded=True) as status:
+                log_container = st.container()
+                # 专门为刷屏的 Chunk 进度准备一个“原地刷新”的占位符
+                chunk_progress_placeholder = st.empty()
 
-                images_b64 = [
-                    base64.b64encode(img.read()).decode("utf-8")
-                    for img in (uploaded_images or [])
-                ]
                 try:
-                    res = requests.post(
-                        REVIEW_API_URL,
-                        json={"document_text": doc_text, "images_base64": images_b64},
-                    )
-                    res.raise_for_status()
-                    result = res.json()
-                    status.update(label="审查完成", state="complete", expanded=False)
+                    payload = {
+                        "document_text": doc_text,
+                        "images_base64": [
+                            base64.b64encode(img.read()).decode("utf-8")
+                            for img in (uploaded_images or [])
+                        ]
+                        if uploaded_images
+                        else [],
+                        "enable_full_text_check": enable_full_text,
+                        "enable_double_rag_check": enable_double_rag,
+                    }
 
-                    # 渲染结果
-                    if result["has_issues"]:
-                        st.error("⚠️ 标书存在潜在风险点！")
-                        for issue in result["issues"]:
-                            # 根据问题类型使用不同的提示框
-                            if "合规" in issue["category"]:
-                                st.error(
-                                    f"**[{issue['category']}]** {issue['message']}"
-                                )
-                            elif "语法" in issue["category"]:
-                                st.warning(
-                                    f"**[{issue['category']}]** {issue['message']}"
-                                )
-                            else:
-                                st.info(f"**[{issue['category']}]** {issue['message']}")
-                    else:
-                        st.success("🎉 完美！审查通过，未发现任何违规。")
+                    # 发起流式请求
+                    with requests.post(
+                        f"{REVIEW_API_URL}/stream", json=payload, stream=True
+                    ) as response:
+                        for line in response.iter_lines():
+                            if line:
+                                event = json.loads(line.decode("utf-8"))
 
-                    if result.get("extracted_data"):
-                        st.divider()
-                        st.write("📌 **AI 提取的关键指标**")
-                        st.json(result["extracted_data"])
+                                if event["status"] == "processing":
+                                    # UX 优化：如果是全文通读的高频日志，原地覆盖刷新
+                                    if "全文通读" in event["agent"]:
+                                        chunk_progress_placeholder.info(
+                                            f"⏳ **{event['agent']}**: {event['message']}"
+                                        )
+                                    else:
+                                        log_container.write(
+                                            f"⏳ **{event['agent']}**: {event['message']}"
+                                        )
+
+                                elif event["status"] == "start":
+                                    log_container.write(f"🌟 {event['message']}")
+
+                                elif event["status"] == "final":
+                                    review_result = event["data"]
+                                    status.update(
+                                        label="✨ 审查圆满完成",
+                                        state="complete",
+                                        expanded=False,
+                                    )
+
+                                    # 清空占位符
+                                    chunk_progress_placeholder.empty()
+
+                                    st.divider()
+                                    if review_result["has_issues"]:
+                                        st.error("⚠️ 发现潜在风险点，详情如下：")
+                                        for issue in review_result["issues"]:
+                                            # 根据分类展示不同颜色的提示框
+                                            cat = issue.get("category", "")
+                                            msg = issue.get("message", "")
+                                            evidence = issue.get("evidence", "")
+                                            rule = issue.get("reference_rule", "")
+
+                                            with st.expander(
+                                                f"🚩 [{cat}] {msg[:30]}..."
+                                            ):
+                                                st.warning(f"**问题描述**: {msg}")
+                                                if evidence:
+                                                    st.info(f"**标书原文**: {evidence}")
+                                                if rule:
+                                                    st.error(f"**违反规章**: {rule}")
+                                    else:
+                                        st.success(
+                                            "🎉 完美！审查通过，未发现任何违规。"
+                                        )
+
+                                elif event["status"] == "error":
+                                    status.update(label="❌ 审查中断", state="error")
+                                    st.error(event["message"])
+
                 except Exception as e:
-                    status.update(label="审查失败", state="error")
-                    st.error(f"API 调用失败：{e}")
+                    status.update(label="❌ 连接失败", state="error")
+                    st.error(f"连接审查引擎失败: {e}")
 
 # ==========================================
 # 主界面 3: 📚 知识库管理
@@ -280,7 +322,6 @@ elif nav_selection == "🔍 RAG 穿透测试":
                     response = requests.post(DEBUG_RAG_API, json={"query": test_query})
                     response.raise_for_status()
                     data = response.json()
-
                     st.success(
                         f"🎯 初筛召回 {data['raw_recall_count']} 条数据，重排淘汰后精选 {data['reranked_count']} 条。"
                     )

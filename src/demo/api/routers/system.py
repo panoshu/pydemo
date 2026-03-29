@@ -1,20 +1,22 @@
-import asyncio
 import logging
 import shutil
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, UploadFile
 from langchain_core.messages import HumanMessage
+from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import QueryBundle
 from pydantic import BaseModel
 
-from demo.config import get_settings
-from demo.llm.factory import get_async_llm, get_reranker
-from demo.rag.engine import build_rag_engine
-from demo.rag.ingestion import DEFAULT_DATA_DIR, build_knowledge_base
+from demo.config.factory import get_async_llm
+from demo.rag.engine import get_company_rules_pipeline
+from demo.rag.ingestion import RAG_DOCS_DIT, build_knowledge_base
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/system", tags=["System & Knowledge"])
+
+# 根据你的项目结构定位知识库存储目录
+KB_DIR = RAG_DOCS_DIT
 
 
 class StandardResponse(BaseModel):
@@ -27,35 +29,38 @@ async def health_check():
     return {"status": "success", "message": "Service is running gracefully."}
 
 
+# ==========================================
+# 1. 知识库上传与离线建库触发接口
+# ==========================================
 @router.post("/knowledge/upload", response_model=StandardResponse)
 async def upload_and_ingest_knowledge(
     background_tasks: BackgroundTasks, files: list[UploadFile] = File(...)
 ):
-    """接收上传的制度文件，保存至 data 目录并触发向量库重构"""
-    DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    """接收上传的制度文件，保存至 data 目录并触发向量库全量重建"""
+    KB_DIR.mkdir(parents=True, exist_ok=True)
+    logger.debug(f"📁 知识库目录: {KB_DIR}")
 
     saved_files = []
     for file in files:
         if file.filename:
-            file_path = DEFAULT_DATA_DIR / file.filename
+            file_path = KB_DIR / file.filename
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             saved_files.append(file.filename)
 
-    # 依然放在后台任务执行，因为文件解析和 Embedding 调用较慢
-    background_tasks.add_task(asyncio.to_thread, build_knowledge_base)
+    # build_knowledge_base 是原生 async 的
+    # FastAPI 的 background_tasks 完美支持协程，直接传入即可，无需 to_thread
+    background_tasks.add_task(build_knowledge_base)
 
     return {
         "status": "success",
-        "message": f"成功保存 {len(saved_files)} 个文件。后台正在进行切片与自动持久化至 Milvus...",
+        "message": f"成功保存 {len(saved_files)} 个文件。后台正在进行智能切片与 Milvus 混合建库...",
     }
 
 
 # ==========================================
-# RAG 检索管道调试接口
+# 2. RAG 检索管道调试接口 (Debug)
 # ==========================================
-
-
 class DebugRequest(BaseModel):
     query: str
 
@@ -64,28 +69,28 @@ class DebugRequest(BaseModel):
 async def debug_rag_retrieval(request: DebugRequest) -> dict[str, Any]:
     """
     接收测试 Query，返回大模型生成答案前：
-    1. Milvus 向量检索的初筛召回结果。
-    2. 经过 Reranker 重排过滤后的最终结果。
+    1. Milvus 混合检索 (Dense+BM25+RRF) 的初筛召回结果。
+    2. 经过私有化 Reranker 重排过滤后的最终结果。
     """
-    config = get_settings()
-
-    # 【修改点 2】：获取最新的引擎构建器
-    query_engine = build_rag_engine()
+    # 获取企业级流水线实例
+    pipeline = get_company_rules_pipeline()
     query_bundle = QueryBundle(query_str=request.query)
 
-    # 1. 执行异步检索 (触发 Milvus 初筛)
-    raw_nodes = await query_engine.retriever.aretrieve(request.query)
+    # 1. 执行第一阶段：异步混合初筛召回
+    # (为了在 Debug 中拿到中间态，我们拆开调用流水线底层逻辑)
+    vector_store = pipeline._get_vector_store(overwrite=False)
+    index = VectorStoreIndex.from_vector_store(
+        vector_store, embed_model=pipeline.dense_embed_model
+    )
+    retriever = index.as_retriever(
+        vector_store_query_mode="hybrid", similarity_top_k=pipeline.similarity_top_k
+    )
+    raw_nodes = await retriever.aretrieve(request.query)
 
-    # 【修改点 3】：通过工厂极简获取 Reranker，告别手动拼装配置！
-    reranker = get_reranker(top_n=config.rag.similarity_top_k)
-    reranked_nodes = raw_nodes
-
-    if reranker:
-        # 【修改点 4】：抛弃 asyncio.to_thread！直接调用 LlamaIndex 提供的原生异步重排钩子
-        # 底层会自动路由到我们重写过的 _apostprocess_nodes
-        reranked_nodes = await reranker.apostprocess_nodes(
-            raw_nodes, query_bundle=query_bundle
-        )
+    # 2. 执行第二阶段：私有化深度重排
+    reranked_nodes = await pipeline.reranker.apostprocess_nodes(
+        raw_nodes, query_bundle=query_bundle
+    )
 
     # 格式化输出供前端渲染
     def format_nodes(nodes):
@@ -106,13 +111,15 @@ async def debug_rag_retrieval(request: DebugRequest) -> dict[str, Any]:
         "reranked_nodes": format_nodes(reranked_nodes),
     }
 
-# 定义接收问答请求的 Schema
+
+# ==========================================
+# 3. 智能问答接口 (Chat)
+# ==========================================
 class ChatQueryRequest(BaseModel):
     query: str
     use_rag: bool = True
 
 
-# 定义返回结构的 Schema
 class ChatQueryResponse(BaseModel):
     answer: str
     sources: list[dict]
@@ -124,40 +131,49 @@ async def chat_with_knowledge_base(request: ChatQueryRequest):
     智能问答接口：支持自由切换 RAG 模式与纯大模型模式
     """
     try:
+        # 统一使用带有强制并发排队保护机制的 LangChain LLM 实例
+        llm = get_async_llm()
+
         if request.use_rag:
-            # ==========================================
-            # 模式 A：走 LlamaIndex RAG 检索链路
-            # ==========================================
-            query_engine = build_rag_engine()
-            response = await query_engine.aquery(request.query)
+            # 🌟 架构升级：调用最新的企业级流水线一键查询
+            pipeline = get_company_rules_pipeline()
+            nodes = await pipeline.aretrieve(request.query)
 
-            sources = []
-            for node in response.source_nodes:
-                sources.append(
-                    {
-                        "text": node.node.get_content()[:200] + "...",
-                        "score": round(node.score, 4) if node.score else None,
-                        "file_name": node.node.metadata.get("file_name", "未知文件"),
-                    }
-                )
+            # 整理前端来源展示
+            sources = [
+                {
+                    "text": n.node.get_content()[:200] + "...",
+                    "score": round(n.score, 4) if n.score else None,
+                    "file_name": n.node.metadata.get("file_name", "未知文件"),
+                }
+                for n in nodes
+            ]
 
-            return ChatQueryResponse(answer=str(response), sources=sources)
+            # 统一生成逻辑：手搓高维 Prompt 投喂给 LangChain，代替原先黑盒的 aquery
+            context_str = "\n\n---\n\n".join([n.node.get_content() for n in nodes])
+            prompt = f"""你是一个严谨的企业规章制度助手。请基于以下检索到的【参考资料】回答问题。
+要求：
+1. 严格依据参考资料进行回答，绝不允许编造或凭借自身的训练数据发散。
+2. 如果参考资料中没有相关信息，请明确回答“抱歉，在现有制度文件中未检索到相关规定”。
+
+【参考资料】:
+{context_str}
+
+【用户问题】: {request.query}
+"""
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            return ChatQueryResponse(answer=str(response.content), sources=sources)
 
         else:
-            # ==========================================
-            # 模式 B：脱离知识库，直接走 LangChain 纯大模型对话
-            # ==========================================
-            llm = get_async_llm()
+            # 脱离知识库，直接走纯大模型对话
             messages = [HumanMessage(content=request.query)]
-
-            # 直接向私有化大模型发起对话请求
             response = await llm.ainvoke(messages)
 
             return ChatQueryResponse(
                 answer=str(response.content),
-                sources=[],  # 纯大模型没有外部参考来源
+                sources=[],
             )
 
     except Exception as e:
-        logger.error(f"问答生成异常: {e}", exc_info=True)
-        return ChatQueryResponse(answer=f"系统错误: {str(e)}", sources=[])
+        logger.error(f"❌ 问答生成发生严重异常: {e}", exc_info=True)
+        return ChatQueryResponse(answer=f"系统降级处理，发生错误: {str(e)}", sources=[])
