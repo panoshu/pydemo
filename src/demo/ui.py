@@ -1,5 +1,6 @@
 import base64
 import json
+import uuid
 
 import requests
 import streamlit as st
@@ -10,6 +11,7 @@ REVIEW_API_URL = f"{BASE_URL}/review"
 UPLOAD_KNOWLEDGE_API = f"{BASE_URL}/system/knowledge/upload"
 DEBUG_RAG_API = f"{BASE_URL}/system/knowledge/debug"
 CHAT_RAG_API = f"{BASE_URL}/system/knowledge/chat"
+CHAT_GRAPH_API = f"{BASE_URL}/system/knowledge/chat/graph"
 
 # ==========================================
 # 🎨 全局样式与页面配置
@@ -42,7 +44,13 @@ with st.sidebar:
     # 使用 Radio 模拟现代 Web 应用的侧边栏导航
     nav_selection = st.radio(
         "导航菜单",
-        ["💬 知识库问答", "📝 智能标书审查", "📚 知识库管理", "🔍 RAG 穿透测试"],
+        [
+            "💬 知识库问答 (标准版)",
+            "🤖 智能体对话 (LangGraph)",
+            "📝 智能标书审查",
+            "📚 知识库管理",
+            "🔍 RAG 穿透测试",
+        ],
         label_visibility="collapsed",
     )
 
@@ -61,41 +69,44 @@ with st.sidebar:
 
 
 # ==========================================
-# 主界面 1: 💬 知识库问答 (Gemini 风格)
+# 3. 主界面 1 & 1.5: 融合版的对话模块
 # ==========================================
-if nav_selection == "💬 知识库问答":
-    # 状态初始化
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+if nav_selection in ["💬 知识库问答 (标准版)", "🤖 智能体对话 (LangGraph)"]:
+    is_graph_mode = "LangGraph" in nav_selection
+    current_api_url = CHAT_GRAPH_API if is_graph_mode else CHAT_RAG_API
+    msg_key = "messages_graph" if is_graph_mode else "messages_std"
 
-    # 1. 欢迎空状态 (模仿 Gemini)
-    if not st.session_state.messages:
+    # 🌟 新增：为当前模式分配一个独立的 Session ID 用于后端记忆隔离
+    session_id_key = f"{msg_key}_session_id"
+    if session_id_key not in st.session_state:
+        st.session_state[session_id_key] = str(uuid.uuid4())
+
+    # 🌟 状态隔离：为两个模式使用不同的历史记录 Key，避免切换时串台
+    msg_key = "messages_graph" if is_graph_mode else "messages_std"
+
+    if msg_key not in st.session_state:
+        st.session_state[msg_key] = []
+
+    # 1. 欢迎空状态
+    if not st.session_state[msg_key]:
+        title = "LangGraph 智能体引擎" if is_graph_mode else "标书审查 AI"
         st.markdown(
-            '<div class="hero-title">您好，我是标书审查 AI</div>',
-            unsafe_allow_html=True,
+            f'<div class="hero-title">您好，我是{title}</div>', unsafe_allow_html=True
         )
         st.markdown(
             '<div class="hero-subtitle">我可以帮您解答招投标规章、合规红线以及历史标书中的任何问题。</div>',
             unsafe_allow_html=True,
         )
+        # ...省略三个 col 的快捷提示语...
 
-        # 提供快捷提示词
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.info("💡 **合规提问**\n\n我们公司的系统响应时间红线是多少？")
-        with col2:
-            st.info("💡 **流程咨询**\n\n标书资质文件必须要盖鲜章吗？")
-        with col3:
-            st.info("💡 **历史检索**\n\n提取上一版移动项目标书的核心报价。")
-
-    # 2. 渲染历史对话
-    for message in st.session_state.messages:
-        # 自定义头像：User 用人像，AI 用闪烁星（Gemini 标志性风格）
-        avatar = "🧑‍💻" if message["role"] == "user" else "✨"
+    # 2. 渲染历史对话 (注意改为遍历 st.session_state[msg_key])
+    for message in st.session_state[msg_key]:
+        avatar = (
+            "🧑‍💻" if message["role"] == "user" else ("🤖" if is_graph_mode else "✨")
+        )
         with st.chat_message(message["role"], avatar=avatar):
             st.markdown(message["content"])
 
-            # 渲染历史来源
             if message.get("sources"):
                 with st.expander("📚 参考的知识源"):
                     for idx, source in enumerate(message["sources"]):
@@ -108,46 +119,72 @@ if nav_selection == "💬 知识库问答":
     # 3. 底部吸附的输入框
     if prompt := st.chat_input("请输入您的问题，按回车发送..."):
         # 用户消息上屏
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state[msg_key].append({"role": "user", "content": prompt})
         with st.chat_message("user", avatar="🧑‍💻"):
             st.markdown(prompt)
 
         # AI 思考与回复
-        with st.chat_message("assistant", avatar="✨"):
-            loading_text = (
-                "✨ 正在检索知识库并思考回答..."
+        ai_avatar = "🤖" if is_graph_mode else "✨"
+        with st.chat_message("assistant", avatar=ai_avatar):
+            message_placeholder = st.empty()
+
+            engine_name = "LangGraph 节点" if is_graph_mode else "底层系统"
+            initial_status = (
+                f"🔄 {engine_name}正在进行向量召回与重排..."
                 if use_rag
-                else "✨ 正在进行独立逻辑推理..."
+                else f"🔄 {engine_name}正在思考..."
             )
-            with st.spinner(loading_text):
-                try:
-                    payload = {"query": prompt, "use_rag": use_rag}
-                    response = requests.post(CHAT_RAG_API, json=payload)
-                    response.raise_for_status()
-                    data = response.json()
+            message_placeholder.markdown(f"*{initial_status}*")
 
-                    answer = data.get("answer", "未能获取有效回答。")
-                    sources = data.get("sources", [])
+            try:
+                payload = {
+                    "query": prompt,
+                    "use_rag": use_rag,
+                    "session_id": st.session_state[session_id_key],
+                }
+                # 发送到动态选择的 API
+                response = requests.post(current_api_url, json=payload, stream=True)
+                response.raise_for_status()
 
-                    st.markdown(answer)
+                full_answer = ""
+                sources = []
 
-                    if sources:
-                        with st.expander("📚 参考的知识源"):
-                            for idx, source in enumerate(sources):
-                                st.caption(
-                                    f"来源 {idx + 1} | 相关度: {source.get('score', 'N/A')}"
-                                )
-                                st.write(source.get("text", ""))
-                                st.divider()
+                # 监听流式事件（标准版和 Graph 版返回的数据结构在经过我们封装后是完全一致的）
+                for line in response.iter_lines():
+                    if line:
+                        event = json.loads(line.decode("utf-8"))
 
-                    # 存入历史（同时保存 sources）
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": answer, "sources": sources}
-                    )
+                        event_type = event.get("type")
+                        if event_type == "sources":
+                            sources = event.get("data", [])
+                            message_placeholder.markdown("*✨ 正在生成回答...*")
 
-                except Exception as e:
-                    st.error(f"网络请求失败：{e}")
+                        elif event_type == "chunk":
+                            full_answer += event.get("content", "")
+                            message_placeholder.markdown(full_answer + "▌")
 
+                        elif event_type == "error":
+                            full_answer = f"⚠️ 发生错误: {event.get('message')}"
+                            message_placeholder.error(full_answer)
+
+                message_placeholder.markdown(full_answer)
+
+                if sources:
+                    with st.expander("📚 参考的知识源"):
+                        for idx, source in enumerate(sources):
+                            st.caption(
+                                f"来源 {idx + 1} | 相关度: {source.get('score', 'N/A')}"
+                            )
+                            st.write(source.get("text", ""))
+                            st.divider()
+
+                # 存入对应模式的历史
+                st.session_state[msg_key].append(
+                    {"role": "assistant", "content": full_answer, "sources": sources}
+                )
+
+            except Exception as e:
+                st.error(f"网络请求失败：{e}")
 
 # ==========================================
 # 主界面 2: 📝 智能标书审查 (Agent 模式)
